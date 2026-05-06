@@ -78,7 +78,7 @@ test('blocks over-limit requests', async (t) => {
   assert.match(res.body, /Token limit exceeded/);
 });
 
-test('passes through valid requests', async (t) => {
+test('passes through valid requests and injects a default model', async (t) => {
   const upstream = http.createServer((req, res) => {
     const chunks = [];
     req.on('data', (chunk) => chunks.push(chunk));
@@ -116,5 +116,8 @@ test('passes through valid requests', async (t) => {
   assert.equal(res.headers['x-upstream'], 'ok');
   const parsed = JSON.parse(res.body);
   assert.equal(parsed.seenAuth, 'Bearer upstream-secret');
-  assert.equal(parsed.body, payload);
+  assert.deepEqual(JSON.parse(parsed.body), {
+    messages: [{ role: 'user', content: 'hi' }],
+    model: 'ollama/gpt-oss:120b-cloud'
+  });
 });

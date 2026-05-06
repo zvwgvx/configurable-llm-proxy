@@ -21,22 +21,35 @@ function loadDotEnv(envPath = '.env') {
 
 loadDotEnv();
 
-function json(res, statusCode, body) {
+function json(res, statusCode, body, extraHeaders = {}) {
   const payload = JSON.stringify(body);
   res.writeHead(statusCode, {
     'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(payload)
+    'content-length': Buffer.byteLength(payload),
+    ...extraHeaders
   });
   res.end(payload);
 }
 
-function text(res, statusCode, message) {
+function text(res, statusCode, message, extraHeaders = {}) {
   const payload = message + '\n';
   res.writeHead(statusCode, {
     'content-type': 'text/plain; charset=utf-8',
-    'content-length': Buffer.byteLength(payload)
+    'content-length': Buffer.byteLength(payload),
+    ...extraHeaders
   });
   res.end(payload);
+}
+
+function corsHeaders(req) {
+  const origin = req.headers.origin || '*';
+  return {
+    'access-control-allow-origin': origin,
+    'access-control-allow-methods': 'GET,POST,OPTIONS',
+    'access-control-allow-headers': req.headers['access-control-request-headers'] || 'authorization,content-type',
+    'access-control-max-age': '86400',
+    vary: 'Origin'
+  };
 }
 
 function readBody(req) {
@@ -54,7 +67,8 @@ function makeConfig(env = process.env) {
     proxyApiKey: env.PROXY_API_KEY || '',
     tokenLimit: Number(env.TOKEN_LIMIT || 4000),
     upstreamBaseUrl: env.UPSTREAM_BASE_URL || '',
-    upstreamApiKey: env.UPSTREAM_API_KEY || ''
+    upstreamApiKey: env.UPSTREAM_API_KEY || '',
+    defaultModel: env.DEFAULT_MODEL || 'ollama/gpt-oss:120b-cloud'
   };
 }
 
@@ -72,35 +86,59 @@ function createHandler(env = process.env) {
   return async function handler(req, res) {
     const config = makeConfig(env);
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const cors = corsHeaders(req);
+
+    if (req.method === 'OPTIONS') {
+      return text(res, 204, '', cors);
+    }
 
     if (req.method === 'GET' && url.pathname === '/health') {
-      return json(res, 200, { ok: true });
+      return json(res, 200, { ok: true }, cors);
+    }
+
+    if (req.method === 'GET' && url.pathname === '/v1/models') {
+      return json(res, 200, {
+        object: 'list',
+        data: [
+          {
+            id: config.defaultModel,
+            object: 'model',
+            created: 0,
+            owned_by: 'proxy'
+          }
+        ]
+      }, cors);
     }
 
     if (req.method !== 'POST' || url.pathname !== '/v1/chat/completions') {
-      return text(res, 404, 'Not found');
+      return text(res, 404, 'Not found', cors);
     }
 
     if (!config.proxyApiKey || !config.upstreamBaseUrl || !config.upstreamApiKey) {
-      return json(res, 500, { error: 'Proxy is not configured' });
+      return json(res, 500, { error: 'Proxy is not configured' }, cors);
     }
 
     if (!isAuthorized(req, config.proxyApiKey)) {
-      return json(res, 401, { error: { message: 'Invalid proxy API key' } });
+      return json(res, 401, { error: { message: 'Invalid proxy API key' } }, cors);
     }
 
     let rawBody = '';
     try {
       rawBody = await readBody(req);
     } catch {
-      return json(res, 400, { error: { message: 'Invalid request body' } });
+      return json(res, 400, { error: { message: 'Invalid request body' } }, cors);
     }
 
     let body;
     try {
       body = rawBody ? JSON.parse(rawBody) : {};
     } catch {
-      return json(res, 400, { error: { message: 'Request body must be JSON' } });
+      return json(res, 400, { error: { message: 'Request body must be JSON' } }, cors);
+    }
+
+    if (!body.model) {
+      body.model = config.defaultModel;
+      rawBody = JSON.stringify(body);
     }
 
     const tokens = countChatCompletionTokens(body);
@@ -110,7 +148,7 @@ function createHandler(env = process.env) {
           message: `Token limit exceeded: ${tokens} > ${config.tokenLimit}`,
           type: 'token_limit_exceeded'
         }
-      });
+      }, cors);
     }
 
     const headers = new Headers();
@@ -125,7 +163,11 @@ function createHandler(env = process.env) {
       body: rawBody
     });
 
-    res.writeHead(upstreamResponse.status, Object.fromEntries(upstreamResponse.headers.entries()));
+    const responseHeaders = Object.fromEntries(upstreamResponse.headers.entries());
+    for (const [key, value] of Object.entries(cors)) {
+      responseHeaders[key] = value;
+    }
+    res.writeHead(upstreamResponse.status, responseHeaders);
     if (!upstreamResponse.body) {
       return res.end();
     }
@@ -144,8 +186,9 @@ function createServer(env = process.env) {
   const handler = createHandler(env);
   return http.createServer((req, res) => {
     handler(req, res).catch((error) => {
+      const cors = corsHeaders(req);
       if (!res.headersSent) {
-        json(res, 500, { error: { message: error?.message || 'Internal server error' } });
+        json(res, 500, { error: { message: error?.message || 'Internal server error' } }, cors);
         return;
       }
       res.destroy(error);
