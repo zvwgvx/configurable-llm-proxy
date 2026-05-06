@@ -1,6 +1,6 @@
 import http from 'node:http';
-import { countTokens, countChatCompletionTokens } from './tokenizer.js';
 import fs from 'node:fs';
+import { countTokens, countChatCompletionTokens } from './tokenizer.js';
 
 function loadDotEnv(envPath = '.env') {
   if (!fs.existsSync(envPath)) return;
@@ -82,103 +82,44 @@ function upstreamUrl(baseUrl, pathname) {
   return new URL(pathname, baseUrl).toString();
 }
 
-function buildTokenPrefix(requestTokens, tokenLimit) {
-  const remaining = Math.max(tokenLimit - requestTokens, 0);
-  return `Token used: ${requestTokens}/${tokenLimit} | remaining: ${remaining}\n\n`;
-}
-
-function parseOpenAIContent(payload) {
-  const choice = payload?.choices?.[0];
-  const message = choice?.message;
-  if (typeof message?.content === 'string') return message.content;
-  const delta = choice?.delta;
-  if (typeof delta?.content === 'string') return delta.content;
-  return '';
-}
-
-function prefixOpenAIResponse(jsonText, prefix) {
+function extractAssistantTextFromJson(text) {
   try {
-    const payload = JSON.parse(jsonText);
+    const payload = JSON.parse(text);
     const choice = payload?.choices?.[0];
     const message = choice?.message;
-    if (typeof message?.content === 'string') {
-      const content = message.content;
-      message.content = prefix + content;
-      return { body: JSON.stringify(payload), content, prefixed: true };
-    }
-
+    if (typeof message?.content === 'string') return message.content;
     const delta = choice?.delta;
-    if (typeof delta?.content === 'string') {
-      const content = delta.content;
-      delta.content = prefix + content;
-      return { body: JSON.stringify(payload), content, prefixed: true };
-    }
-
-    return { body: jsonText, content: '', prefixed: false };
+    if (typeof delta?.content === 'string') return delta.content;
+    return '';
   } catch {
-    return { body: jsonText, content: '', prefixed: false };
+    return '';
   }
 }
 
-function prefixOpenAIStream(streamText, prefix) {
-  const blocks = streamText.split(/\r?\n\r?\n/);
-  let prefixed = false;
+function extractAssistantTextFromStream(text) {
   let content = '';
-  const out = [];
+  const blocks = text.split(/\r?\n\r?\n/);
 
   for (const block of blocks) {
     if (!block.trim()) continue;
-    const lines = block.split(/\r?\n/);
-    const dataLines = [];
-    const passthroughLines = [];
-
-    for (const line of lines) {
-      if (line.startsWith('data:')) {
-        dataLines.push(line.slice(5).replace(/^\s/, ''));
-      } else {
-        passthroughLines.push(line);
+    for (const line of block.split(/\r?\n/)) {
+      if (!line.startsWith('data:')) continue;
+      const data = line.slice(5).trim();
+      if (!data || data === '[DONE]') continue;
+      try {
+        const payload = JSON.parse(data);
+        const choice = payload?.choices?.[0];
+        const delta = choice?.delta;
+        const message = choice?.message;
+        if (typeof delta?.content === 'string') content += delta.content;
+        else if (typeof message?.content === 'string') content += message.content;
+      } catch {
+        continue;
       }
-    }
-
-    if (!dataLines.length) {
-      out.push(block);
-      continue;
-    }
-
-    const data = dataLines.join('\n');
-    if (data === '[DONE]') {
-      out.push(block);
-      continue;
-    }
-
-    try {
-      const payload = JSON.parse(data);
-      const choice = payload?.choices?.[0];
-      const delta = choice?.delta;
-      const message = choice?.message;
-
-      if (typeof delta?.content === 'string') {
-        content += delta.content;
-        if (!prefixed) {
-          delta.content = prefix + delta.content;
-          prefixed = true;
-        }
-      } else if (typeof message?.content === 'string') {
-        content += message.content;
-        if (!prefixed) {
-          message.content = prefix + message.content;
-          prefixed = true;
-        }
-      }
-
-      const rebuilt = JSON.stringify(payload);
-      out.push([...passthroughLines, `data: ${rebuilt}`].join('\n'));
-    } catch {
-      out.push(block);
     }
   }
 
-  return { body: out.join('\n\n') + (out.length ? '\n\n' : ''), content, prefixed };
+  return content;
 }
 
 function addCors(headers, cors) {
@@ -251,21 +192,17 @@ function createHandler(env = process.env) {
     }
 
     const requestTokens = countChatCompletionTokens(body);
-    const prefix = buildTokenPrefix(requestTokens, config.tokenLimit);
-    const prefixTokens = countTokens(prefix);
-    const maxResponseTokens = config.tokenLimit - requestTokens - prefixTokens;
-
-    if (maxResponseTokens <= 0) {
-      console.warn(`[proxy] blocked request over token budget: request=${requestTokens} prefix=${prefixTokens} limit=${config.tokenLimit}`);
+    if (requestTokens > config.tokenLimit) {
+      console.warn(`[proxy] blocked request over token budget: request=${requestTokens} limit=${config.tokenLimit}`);
       return json(res, 400, {
         error: {
-          message: `Token limit exceeded: ${requestTokens + prefixTokens} > ${config.tokenLimit}`,
+          message: `Token limit exceeded: ${requestTokens} > ${config.tokenLimit}`,
           type: 'token_limit_exceeded'
         }
       }, cors);
     }
 
-    body.max_tokens = typeof body.max_tokens === 'number' ? Math.min(body.max_tokens, maxResponseTokens) : maxResponseTokens;
+    body.max_tokens = typeof body.max_tokens === 'number' ? Math.min(body.max_tokens, config.tokenLimit - requestTokens) : config.tokenLimit - requestTokens;
     rawBody = JSON.stringify(body);
 
     const headers = new Headers();
@@ -281,30 +218,13 @@ function createHandler(env = process.env) {
     });
 
     const upstreamText = await upstreamResponse.text();
-    const upstreamContentType = upstreamResponse.headers.get('content-type') || '';
-    const isStream = upstreamContentType.includes('text/event-stream') || body.stream === true;
-    let responseText = upstreamText;
-    let assistantContent = '';
-    let prefixApplied = false;
+    const isStream = (upstreamResponse.headers.get('content-type') || '').includes('text/event-stream') || body.stream === true;
+    const assistantText = isStream ? extractAssistantTextFromStream(upstreamText) : extractAssistantTextFromJson(upstreamText);
+    const responseTokens = countTokens(assistantText);
+    const totalUsed = requestTokens + responseTokens;
 
-    if (upstreamResponse.ok) {
-      if (isStream) {
-        const transformed = prefixOpenAIStream(upstreamText, prefix);
-        responseText = transformed.body;
-        assistantContent = transformed.content;
-        prefixApplied = transformed.prefixed;
-      } else {
-        const transformed = prefixOpenAIResponse(upstreamText, prefix);
-        responseText = transformed.body;
-        assistantContent = transformed.content;
-        prefixApplied = transformed.prefixed;
-      }
-    }
-
-    const responseTokens = countTokens(assistantContent);
-    const totalUsed = requestTokens + prefixTokens + responseTokens;
     if (upstreamResponse.ok && totalUsed > config.tokenLimit) {
-      console.warn(`[proxy] blocked response over token budget: request=${requestTokens} response=${responseTokens} prefix=${prefixTokens} limit=${config.tokenLimit}`);
+      console.warn(`[proxy] blocked response over token budget: request=${requestTokens} response=${responseTokens} limit=${config.tokenLimit}`);
       return json(res, 400, {
         error: {
           message: `Token limit exceeded: ${totalUsed} > ${config.tokenLimit}`,
@@ -316,7 +236,7 @@ function createHandler(env = process.env) {
     logTokenUsage({
       requestTokens,
       responseTokens,
-      prefixTokens,
+      prefixTokens: 0,
       tokenLimit: config.tokenLimit,
       route: url.pathname
     });
@@ -328,10 +248,9 @@ function createHandler(env = process.env) {
     responseHeaders['x-token-response'] = String(responseTokens);
     responseHeaders['x-token-used'] = String(totalUsed);
     responseHeaders['x-token-remaining'] = String(config.tokenLimit - totalUsed);
-    responseHeaders['x-token-prefix-applied'] = String(prefixApplied);
 
     res.writeHead(upstreamResponse.status, responseHeaders);
-    return res.end(responseText);
+    return res.end(upstreamText);
   };
 }
 
@@ -362,15 +281,4 @@ if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.arg
   start();
 }
 
-export {
-  createServer,
-  createHandler,
-  makeConfig,
-  isAuthorized,
-  countChatCompletionTokens,
-  start,
-  loadDotEnv,
-  buildTokenPrefix,
-  prefixOpenAIResponse,
-  prefixOpenAIStream
-};
+export { createServer, createHandler, makeConfig, isAuthorized, countChatCompletionTokens, start, loadDotEnv };

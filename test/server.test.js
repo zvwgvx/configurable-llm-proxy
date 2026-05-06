@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { createServer, countChatCompletionTokens, buildTokenPrefix } from '../src/server.js';
+import { createServer, countChatCompletionTokens } from '../src/server.js';
 
 function request(port, options, body) {
   return new Promise((resolve, reject) => {
@@ -78,7 +78,7 @@ test('blocks over-limit requests', async (t) => {
   assert.match(res.body, /Token limit exceeded/);
 });
 
-test('passes through valid non-stream requests and prefixes assistant text', async (t) => {
+test('passes through valid non-stream requests without modifying assistant text', async (t) => {
   const upstream = http.createServer((req, res) => {
     const chunks = [];
     req.on('data', (chunk) => chunks.push(chunk));
@@ -120,12 +120,54 @@ test('passes through valid non-stream requests and prefixes assistant text', asy
   assert.equal(res.statusCode, 200);
   assert.equal(res.headers['x-upstream'], 'ok');
   const parsed = JSON.parse(res.body);
-  assert.ok(parsed.choices[0].message.content.startsWith('Token used: '));
-  assert.ok(parsed.choices[0].message.content.endsWith('Hello!'));
-  assert.equal(res.headers['x-token-prefix-applied'], 'true');
+  assert.equal(parsed.choices[0].message.content, 'Hello!');
+  assert.equal(res.headers['x-token-request'], res.headers['x-token-request']);
+  assert.ok(Number(res.headers['x-token-used']) >= Number(res.headers['x-token-request']));
+  assert.ok(Number(res.headers['x-token-remaining']) <= 4000);
 });
 
-test('passes through valid stream requests and prefixes first delta', async (t) => {
+test('blocks when assistant response would exceed the token limit', async (t) => {
+  const upstream = http.createServer((req, res) => {
+    assert.equal(req.headers.authorization, 'Bearer upstream-secret');
+    res.writeHead(200, { 'content-type': 'application/json', 'x-upstream': 'ok' });
+    res.end(JSON.stringify({
+      id: 'chatcmpl-1',
+      object: 'chat.completion',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'x'.repeat(5000) }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 10, completion_tokens: 5000, total_tokens: 5010 }
+    }));
+  });
+
+  const upstreamPort = await listen(upstream);
+  const env = {
+    PROXY_API_KEY: 'secret',
+    UPSTREAM_BASE_URL: `http://127.0.0.1:${upstreamPort}`,
+    UPSTREAM_API_KEY: 'upstream-secret',
+    TOKEN_LIMIT: '100'
+  };
+  const server = createServer(env);
+  const port = await listen(server);
+  t.after(() => {
+    server.close();
+    upstream.close();
+  });
+
+  const payload = JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] });
+  const res = await request(port, {
+    method: 'POST',
+    path: '/v1/chat/completions',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer secret'
+    }
+  }, payload);
+
+  assert.equal(res.statusCode, 400);
+  assert.match(res.body, /Token limit exceeded/);
+  assert.doesNotMatch(res.body, /x{10}/);
+});
+
+test('passes through valid stream requests without modifying assistant text', async (t) => {
   const upstream = http.createServer((req, res) => {
     assert.equal(req.headers.authorization, 'Bearer upstream-secret');
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
@@ -160,12 +202,8 @@ test('passes through valid stream requests and prefixes first delta', async (t) 
   }, payload);
 
   assert.equal(res.statusCode, 200);
-  assert.match(res.body, /Token used:/);
-  assert.match(res.body, /data: .*Token used:/);
+  assert.match(res.body, /data: .*Hello/);
+  assert.match(res.body, /data: .*world/);
+  assert.doesNotMatch(res.body, /Token used:/);
 });
 
-test('builds a readable token prefix', () => {
-  const prefix = buildTokenPrefix(12, 4000);
-  assert.match(prefix, /Token used: 12\/4000/);
-  assert.match(prefix, /remaining: 3988/);
-});
