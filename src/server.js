@@ -1,5 +1,25 @@
 import http from 'node:http';
+import fs from 'node:fs';
 import { countChatCompletionTokens } from './tokenizer.js';
+
+function loadDotEnv(envPath = '.env') {
+  if (!fs.existsSync(envPath)) return;
+  const content = fs.readFileSync(envPath, 'utf8');
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const index = trimmed.indexOf('=');
+    if (index === -1) continue;
+    const key = trimmed.slice(0, index).trim();
+    let value = trimmed.slice(index + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (!(key in process.env)) process.env[key] = value;
+  }
+}
+
+loadDotEnv();
 
 function json(res, statusCode, body) {
   const payload = JSON.stringify(body);
@@ -30,7 +50,7 @@ function readBody(req) {
 
 function makeConfig(env = process.env) {
   return {
-    port: Number(env.PORT || 3000),
+    port: Number(env.PORT || 2026),
     proxyApiKey: env.PROXY_API_KEY || '',
     tokenLimit: Number(env.TOKEN_LIMIT || 4000),
     upstreamBaseUrl: env.UPSTREAM_BASE_URL || '',
@@ -146,4 +166,4 @@ if (process.env.NODE_ENV !== 'test' && import.meta.url === `file://${process.arg
   start();
 }
 
-export { createServer, createHandler, makeConfig, isAuthorized, countChatCompletionTokens, start };
+export { createServer, createHandler, makeConfig, isAuthorized, countChatCompletionTokens, start, loadDotEnv };
